@@ -91,7 +91,7 @@ def split_image(img: Image.Image, upload_folder: str):
 def h_manhattan(s):
     d = 0
     for i, v in enumerate(s):
-        if v == 0: 
+        if v == 0:
             continue
         tx, ty = divmod(v - 1, 3)
         x, y = divmod(i, 3)
@@ -160,8 +160,13 @@ def a_star_with_path(initial_state, heuristic="manhattan"):
 # -----------------------------------------------------------------------------
 @app.after_request
 def add_security_headers(resp):
+    # Allow inline <script> because this app renders JS inline in the template.
+    # If you later move JS into a static .js file, you can remove 'unsafe-inline'.
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self';"
+        "default-src 'self'; "
+        "img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline';"
     )
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
@@ -171,7 +176,6 @@ def favicon():
     icon = os.path.join(UPLOAD_FOLDER, "favicon.ico")
     if os.path.exists(icon):
         return send_from_directory(UPLOAD_FOLDER, "favicon.ico", mimetype="image/x-icon")
-    # No favicon provided; keep logs quiet
     return ("", 204)
 
 @app.route("/", methods=["GET", "POST"])
@@ -198,7 +202,6 @@ def home():
         app.logger.info('new_game image_uploaded seed=%s filename="%s"', seed, filename)
 
     else:
-        # optional shareable state via ?state=1,2,3,4,5,6,7,8,0
         qs = request.args.get("state")
         if qs:
             try:
