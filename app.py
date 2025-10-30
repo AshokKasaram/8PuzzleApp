@@ -32,7 +32,7 @@ logging.basicConfig(
 app.logger.info("8-puzzle service starting")
 
 # -----------------------------------------------------------------------------
-# Session helpers (no globals; multi-user safe)
+# Session helpers (multi-user safe)
 # -----------------------------------------------------------------------------
 def _get_state(): return session.get("state", [])
 def _set_state(s): session["state"] = s
@@ -42,6 +42,10 @@ def _set_moves(n): session["moves"] = n
 
 def _get_tiles(): return session.get("tiles", [])
 def _set_tiles(t): session["tiles"] = t
+
+def _clear_session():
+    for k in ("state", "moves", "tiles"):
+        session.pop(k, None)
 
 # -----------------------------------------------------------------------------
 # Utilities
@@ -156,12 +160,10 @@ def a_star_with_path(initial_state, heuristic="manhattan"):
     return -1, []
 
 # -----------------------------------------------------------------------------
-# Routes
+# Security headers (allow inline JS so the buttons work)
 # -----------------------------------------------------------------------------
 @app.after_request
 def add_security_headers(resp):
-    # Allow inline <script> because this app renders JS inline in the template.
-    # If you later move JS into a static .js file, you can remove 'unsafe-inline'.
     resp.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "img-src 'self' data:; "
@@ -171,6 +173,9 @@ def add_security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @app.route("/favicon.ico")
 def favicon():
     icon = os.path.join(UPLOAD_FOLDER, "favicon.ico")
@@ -180,6 +185,10 @@ def favicon():
 
 @app.route("/", methods=["GET", "POST"])
 def home():
+    # On plain GET (no shared state), clear session so a refresh starts from zero
+    if request.method == "GET" and not request.args.get("state"):
+        _clear_session()
+
     if request.method == "POST":
         if "file" not in request.files:
             return "No file part", 400
@@ -197,11 +206,11 @@ def home():
 
         seed = request.form.get("seed")
         _set_tiles(split_image(img, UPLOAD_FOLDER))
-        _set_state(shuffle_tiles(int(seed)) if seed else shuffle_tiles())
+        _set_state(shuffle_tiles(int(seed)) if (seed and seed.isdigit()) else shuffle_tiles())
         _set_moves(0)
         app.logger.info('new_game image_uploaded seed=%s filename="%s"', seed, filename)
-
     else:
+        # Shared link support: /?state=1,2,3,4,5,6,7,8,0
         qs = request.args.get("state")
         if qs:
             try:
@@ -261,6 +270,7 @@ def home():
     <button onclick="getHint()">Hint</button>
     <button onclick="copyShare()">Copy Share Link</button>
     <button onclick="resetSolved()">Show Solved</button>
+    <button onclick="resetGame()">Reset</button>
   </div>
 
   <div id="grid" class="grid"></div>
@@ -353,6 +363,11 @@ def home():
     alert('Shareable link copied!');
   }
 
+  function resetGame(){
+    fetch('/reset', { method: 'POST' })
+      .then(()=> window.location.href = '/'); // reload empty
+  }
+
   renderGrid();
 </script>
 </body>
@@ -419,6 +434,11 @@ def hint():
         if path:
             return jsonify({"next_state": list(path[0])})
     return jsonify({"error": "No hint available"})
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    _clear_session()
+    return jsonify({"ok": True})
 
 @app.route("/healthz")
 def healthz():
