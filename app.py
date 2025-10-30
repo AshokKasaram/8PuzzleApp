@@ -1,129 +1,54 @@
 # app.py
 import os
+import time
+import logging
 import random
 from heapq import heappop, heappush
 from itertools import count
 
-from flask import Flask, render_template_string, jsonify, request, url_for
+from flask import (
+    Flask, render_template_string, jsonify, request, url_for,
+    session, send_from_directory
+)
 from werkzeug.utils import secure_filename
 from PIL import Image
 
 # -----------------------------------------------------------------------------
-# Flask setup
+# App / config
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
-
-# Where we save the 3x3 image tiles (Render provides ephemeral disk per deploy;
-# this is fine for a toy app)
+app.secret_key = os.getenv("SECRET_KEY", "dev-only-change-me")  # set SECRET_KEY in Render
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB uploads
 UPLOAD_FOLDER = os.path.join(app.root_path, "static")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# Limit upload size (4 MB) and restrict to common image types
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
+Image.MAX_IMAGE_PIXELS = 10_000_000  # guard against decompression bombs
+START_TS = time.time()
 
-# Global game state (simple demo). For multi-user production, use sessions/db.
-tiles = []            # list of tile image URLs
-current_state = []    # list of 9 ints representing board (0 is blank)
-move_count = 0        # number of user moves
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"ts":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}'
+)
+app.logger.info("8-puzzle service starting")
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Session helpers (no globals; multi-user safe)
+# -----------------------------------------------------------------------------
+def _get_state(): return session.get("state", [])
+def _set_state(s): session["state"] = s
+
+def _get_moves(): return session.get("moves", 0)
+def _set_moves(n): session["moves"] = n
+
+def _get_tiles(): return session.get("tiles", [])
+def _set_tiles(t): session["tiles"] = t
+
+# -----------------------------------------------------------------------------
+# Utilities
 # -----------------------------------------------------------------------------
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-
-# Manhattan distance heuristic for A*
-def manhattan_distance(state):
-    distance = 0
-    for index, value in enumerate(state):
-        if value == 0:
-            continue
-        target_x, target_y = divmod(value - 1, 3)
-        x, y = divmod(index, 3)
-        distance += abs(target_x - x) + abs(target_y - y)
-    return distance
-
-
-# A* search to find the minimum number of moves to solve the 8-puzzle
-def a_star_search(initial_state):
-    goal_state = tuple(range(1, 9)) + (0,)
-    parent_map = {tuple(initial_state): None}
-    g_score = {tuple(initial_state): 0}
-    f_score = {tuple(initial_state): manhattan_distance(initial_state)}
-
-    open_set = []
-    heappush(open_set, (f_score[tuple(initial_state)], next(count()), tuple(initial_state)))
-
-    while open_set:
-        _, __, current = heappop(open_set)
-
-        if current == goal_state:
-            # Reconstruct path length (number of moves)
-            moves = 0
-            while parent_map[current]:
-                current = parent_map[current]
-                moves += 1
-            return moves
-
-        current_index = current.index(0)
-        x, y = divmod(current_index, 3)
-        neighbors = []
-        if x > 0: neighbors.append(current_index - 3)
-        if x < 2: neighbors.append(current_index + 3)
-        if y > 0: neighbors.append(current_index - 1)
-        if y < 2: neighbors.append(current_index + 1)
-
-        for neighbor in neighbors:
-            new_state = list(current)
-            new_state[current_index], new_state[neighbor] = new_state[neighbor], new_state[current_index]
-            new_state = tuple(new_state)
-
-            tentative_g = g_score[current] + 1
-            if new_state not in g_score or tentative_g < g_score[new_state]:
-                parent_map[new_state] = current
-                g_score[new_state] = tentative_g
-                f_score[new_state] = tentative_g + manhattan_distance(new_state)
-                heappush(open_set, (f_score[new_state], next(count()), new_state))
-
-    return -1  # Unsolvable (shouldn’t happen if we generate solvable shuffles)
-
-
-# Cut image to 3x3 and save tiles to /static
-def split_image(img: Image.Image, upload_folder: str):
-    # Make it square (crop the smallest side), then resize to 300x300
-    w, h = img.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    img = img.crop((left, top, left + side, top + side)).resize((300, 300))
-
-    tile_size = img.size[0] // 3
-    pieces = []
-    for i in range(3):
-        for j in range(3):
-            L = j * tile_size
-            U = i * tile_size
-            tile = img.crop((L, U, L + tile_size, U + tile_size))
-            tile_path = os.path.join(upload_folder, f"tile_{i}_{j}.png")
-            tile.save(tile_path)
-            pieces.append(url_for("static", filename=f"tile_{i}_{j}.png"))
-
-    return pieces
-
-
-# Generate a random solvable permutation
-def shuffle_tiles():
-    state = list(range(1, 9)) + [0]
-    while True:
-        random.shuffle(state)
-        if is_solvable(state):
-            return state
-
-
-# Check 8-puzzle solvability by counting inversions
 def is_solvable(state):
     inv = 0
     for i in range(len(state)):
@@ -132,58 +57,183 @@ def is_solvable(state):
                 inv += 1
     return inv % 2 == 0
 
+def shuffle_tiles(seed: int | None = None):
+    rng = random.Random(seed)
+    state = list(range(1, 9)) + [0]
+    while True:
+        rng.shuffle(state)
+        if is_solvable(state):
+            return state
+
+def split_image(img: Image.Image, upload_folder: str):
+    # crop to square center, then resize to 300x300
+    w, h = img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    img = img.crop((left, top, left + side, top + side)).resize((300, 300))
+
+    tile_size = img.size[0] // 3
+    urls = []
+    for i in range(3):
+        for j in range(3):
+            L = j * tile_size
+            U = i * tile_size
+            tile = img.crop((L, U, L + tile_size, U + tile_size))
+            path = os.path.join(upload_folder, f"tile_{i}_{j}.png")
+            tile.save(path)
+            urls.append(url_for("static", filename=f"tile_{i}_{j}.png"))
+    return urls
+
+# -----------------------------------------------------------------------------
+# Heuristics + A* with path
+# -----------------------------------------------------------------------------
+def h_manhattan(s):
+    d = 0
+    for i, v in enumerate(s):
+        if v == 0: 
+            continue
+        tx, ty = divmod(v - 1, 3)
+        x, y = divmod(i, 3)
+        d += abs(tx - x) + abs(ty - y)
+    return d
+
+def h_misplaced(s):
+    return sum(1 for i, v in enumerate(s) if v and v != i + 1)
+
+def h_linear_conflict(s):
+    def conflicts(line):
+        vals = [v for v in line if v]
+        inv = 0
+        for i in range(len(vals)):
+            for j in range(i + 1, len(vals)):
+                if vals[i] > vals[j]:
+                    inv += 1
+        return inv
+
+    man = h_manhattan(s)
+    rows = sum(conflicts([s[r*3 + c] for c in range(3) if (s[r*3 + c] - 1) // 3 == r]) for r in range(3))
+    cols = sum(conflicts([s[r*3 + c] for r in range(3) if (s[r*3 + c] - 1) % 3 == c]) for c in range(3))
+    return man + 2 * (rows + cols)
+
+HEURISTICS = {"manhattan": h_manhattan, "misplaced": h_misplaced, "linear": h_linear_conflict}
+
+def a_star_with_path(initial_state, heuristic="manhattan"):
+    h = HEURISTICS.get(heuristic, h_manhattan)
+    start = tuple(initial_state)
+    goal = tuple(range(1, 9)) + (0,)
+    parent = {start: None}
+    g = {start: 0}
+    f = {start: h(start)}
+    pq = []
+    heappush(pq, (f[start], next(count()), start))
+    while pq:
+        _, __, cur = heappop(pq)
+        if cur == goal:
+            path = []
+            while parent[cur] is not None:
+                path.append(cur)
+                cur = parent[cur]
+            path.reverse()
+            return len(path), path
+        zi = cur.index(0)
+        x, y = divmod(zi, 3)
+        nbrs = []
+        if x > 0: nbrs.append(zi - 3)
+        if x < 2: nbrs.append(zi + 3)
+        if y > 0: nbrs.append(zi - 1)
+        if y < 2: nbrs.append(zi + 1)
+        for ni in nbrs:
+            nxt = list(cur)
+            nxt[zi], nxt[ni] = nxt[ni], nxt[zi]
+            nxt = tuple(nxt)
+            ng = g[cur] + 1
+            if nxt not in g or ng < g[nxt]:
+                parent[nxt] = cur
+                g[nxt] = ng
+                f[nxt] = ng + h(nxt)
+                heappush(pq, (f[nxt], next(count()), nxt))
+    return -1, []
 
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
+@app.after_request
+def add_security_headers(resp):
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self';"
+    )
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+@app.route("/favicon.ico")
+def favicon():
+    icon = os.path.join(UPLOAD_FOLDER, "favicon.ico")
+    if os.path.exists(icon):
+        return send_from_directory(UPLOAD_FOLDER, "favicon.ico", mimetype="image/x-icon")
+    # No favicon provided; keep logs quiet
+    return ("", 204)
+
 @app.route("/", methods=["GET", "POST"])
 def home():
-    global tiles, current_state, move_count
-
     if request.method == "POST":
-        # Reset the game state
-        move_count = 0
-
         if "file" not in request.files:
             return "No file part", 400
-
-        img_file = request.files["file"]
-        if img_file.filename == "":
+        f = request.files["file"]
+        if f.filename == "":
             return "No selected file", 400
-
-        if not allowed_file(img_file.filename):
+        if not allowed_file(f.filename):
             return "Invalid file type. Please upload PNG/JPG/JPEG/WEBP.", 400
 
-        # Open with PIL and generate tiles
-        filename = secure_filename(img_file.filename)
+        filename = secure_filename(f.filename)
         try:
-            img = Image.open(img_file.stream).convert("RGB")
+            img = Image.open(f.stream).convert("RGB")
         except Exception:
             return "Could not open image. Please try a different file.", 400
 
-        tiles = split_image(img, UPLOAD_FOLDER)
-        current_state = shuffle_tiles()
+        seed = request.form.get("seed")
+        _set_tiles(split_image(img, UPLOAD_FOLDER))
+        _set_state(shuffle_tiles(int(seed)) if seed else shuffle_tiles())
+        _set_moves(0)
+        app.logger.info('new_game image_uploaded seed=%s filename="%s"', seed, filename)
 
-    # Render page
+    else:
+        # optional shareable state via ?state=1,2,3,4,5,6,7,8,0
+        qs = request.args.get("state")
+        if qs:
+            try:
+                st = [int(x) for x in qs.split(",")]
+                if len(st) == 9 and is_solvable(st):
+                    _set_state(st)
+                    _set_moves(0)
+                    app.logger.info("state_loaded_from_query")
+            except Exception:
+                pass
+
+    tiles = _get_tiles()
+    state = _get_state()
+    moves = _get_moves()
+
     return render_template_string(
         """
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>8-Puzzle Game</title>
 <style>
-  body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background-color: #87CEFA; }
-  .grid { display: grid; grid-template-columns: repeat(3, 100px); gap: 5px; justify-content: center; margin: 20px auto; }
-  .tile { width: 100px; height: 100px; border: 1px solid #1E90FF; cursor: pointer; background-size: cover; background-position: center; transition: background 0.2s ease; }
-  .blank { background-color: #B0E0E6; cursor: default; }
-  button { margin: 10px; padding: 10px 20px; font-size: 16px; background-color: #1E90FF; color: #fff; border: none; border-radius: 5px; }
-  button:hover { background-color: #4682B4; }
-  #status { margin-top: 20px; font-size: 18px; color: #2F4F4F; }
-  @media (max-width: 600px) {
-    .grid { grid-template-columns: repeat(3, 33vw); gap: 2vw; }
-    .tile { width: 33vw; height: 33vw; }
+  body{font-family:Arial,Helvetica,sans-serif;text-align:center;padding:20px;background:#87CEFA}
+  .row{margin:8px 0}
+  .grid{display:grid;grid-template-columns:repeat(3,100px);gap:5px;justify-content:center;margin:16px auto}
+  .tile{width:100px;height:100px;border:1px solid #1E90FF;background-size:cover;background-position:center;cursor:pointer}
+  .blank{background:#B0E0E6;cursor:default}
+  button,select,input{padding:8px 12px;margin:0 6px 6px 0;border-radius:6px;border:1px solid #1E90FF;background:#1E90FF;color:#fff}
+  button:hover{background:#4682B4}
+  #status{margin-top:10px;color:#2F4F4F}
+  @media (max-width:600px){
+    .grid{grid-template-columns:repeat(3,33vw);gap:2vw}
+    .tile{width:33vw;height:33vw}
   }
 </style>
 </head>
@@ -191,80 +241,113 @@ def home():
   <h1>8-Puzzle Game</h1>
   <p>Upload an image to scramble it into a 3×3 puzzle. Click tiles to move them and solve it!</p>
 
-  <form method="post" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".png,.jpg,.jpeg,.webp" required />
-    <button type="submit">Upload Image</button>
+  <form method="post" enctype="multipart/form-data" class="row">
+    <input type="file" name="file" accept=".png,.jpg,.jpeg,.webp" required>
+    <input type="number" name="seed" placeholder="Optional seed">
+    <button type="submit">Upload & Start</button>
   </form>
 
-  <button id="show-solution" onclick="showSolution()">Show Solution</button>
-  <button id="min-moves" onclick="getMinimumMoves()">Get Minimum Moves to Solve</button>
+  <div class="row">
+    <select id="heuristic">
+      <option value="manhattan">Manhattan</option>
+      <option value="misplaced">Misplaced tiles</option>
+      <option value="linear">Linear conflict</option>
+    </select>
+    <button onclick="getMinimumMoves()">Min Moves</button>
+    <button onclick="playSolution()">Play Solution</button>
+    <button onclick="getHint()">Hint</button>
+    <button onclick="copyShare()">Copy Share Link</button>
+    <button onclick="resetSolved()">Show Solved</button>
+  </div>
 
   <div id="grid" class="grid"></div>
-  <p id="move-count">Moves: {{ move_count }}</p>
-  <p id="status"></p>
+  <div class="row"><strong id="move-count">Moves: {{ moves }}</strong></div>
+  <div id="status"></div>
 
 <script>
   let state = {{ state|tojson }};
-  let moveCount = {{ move_count|tojson }};
+  let moveCount = {{ moves|tojson }};
   const tiles = {{ tiles|tojson }};
   const grid = document.getElementById("grid");
   const moveCountDisplay = document.getElementById("move-count");
   const statusDisplay = document.getElementById("status");
 
-  function renderGrid() {
+  function renderGrid(){
     grid.innerHTML = '';
-    if (!state || state.length === 0) {
+    if(!state || state.length===0){
       statusDisplay.textContent = "Upload an image to start!";
       return;
     }
     state.forEach((tile) => {
       const div = document.createElement('div');
-      if (tile === 0) {
+      if(tile===0){
         div.className = 'tile blank';
-      } else {
+      }else{
         div.className = 'tile';
-        div.style.backgroundImage = `url(${tiles[tile - 1]})`;
+        div.style.backgroundImage = `url(${tiles[tile-1]})`;
         div.onclick = () => moveTile(tile);
       }
       grid.appendChild(div);
     });
   }
 
-  function moveTile(tile) {
+  function moveTile(tile){
     fetch('/move', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `tile=${tile}`
-    }).then(r => r.json())
-     .then(data => {
-        state = data.state;
-        moveCount = data.move_count;
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`tile=${tile}`
+    }).then(r=>r.json()).then(d=>{
+      state = d.state; moveCount = d.move_count;
+      moveCountDisplay.textContent = `Moves: ${moveCount}`;
+      renderGrid();
+      statusDisplay.textContent = d.solved ? "🎉 Solved!" : "";
+    });
+  }
+
+  function resetSolved(){
+    fetch('/solution').then(r=>r.json()).then(d=>{
+      state = d.state; renderGrid(); statusDisplay.textContent = "Solved state shown.";
+    });
+  }
+
+  function getMinimumMoves(){
+    const h = document.getElementById('heuristic').value;
+    fetch('/minimum-moves?heuristic=' + h).then(r=>r.json()).then(d=>{
+      if(d.minimum_moves !== undefined){
+        alert(`Minimum moves (${d.heuristic}): ` + d.minimum_moves);
+      }else{ alert('Error: ' + d.error); }
+    });
+  }
+
+  function playSolution(){
+    const h = document.getElementById('heuristic').value;
+    fetch('/solve?heuristic=' + h).then(r=>r.json()).then(d=>{
+      if(!d.path){ return alert(d.error || 'No solution.'); }
+      const frames = d.path.slice();
+      const step = () => {
+        if(frames.length===0){ statusDisplay.textContent = "Replayed optimal solution."; return; }
+        state = frames.shift(); renderGrid();
+        setTimeout(step, 300);
+      }; step();
+    });
+  }
+
+  function getHint(){
+    fetch('/hint').then(r=>r.json()).then(d=>{
+      if(d.next_state){
+        state = d.next_state; moveCount += 1;
         moveCountDisplay.textContent = `Moves: ${moveCount}`;
         renderGrid();
-        if (data.solved) {
-          statusDisplay.textContent = "🎉 Congratulations! You solved the puzzle!";
-        } else {
-          statusDisplay.textContent = "";
-        }
-     });
-  }
-
-  function showSolution() {
-    fetch('/solution').then(r => r.json()).then(data => {
-      state = data.state;
-      renderGrid();
-      statusDisplay.textContent = "Here's the solved puzzle!";
+      }else{ alert(d.error || 'No hint'); }
     });
   }
 
-  function getMinimumMoves() {
-    fetch('/minimum-moves').then(r => r.json()).then(data => {
-      if (data.minimum_moves !== undefined) {
-        alert('Minimum moves to solve: ' + data.minimum_moves);
-      } else {
-        alert('Error: ' + data.error);
-      }
-    });
+  function copyShare(){
+    if(!state || state.length!==9) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set('state', state.join(','));
+    navigator.clipboard.writeText(url.toString());
+    alert('Shareable link copied!');
   }
 
   renderGrid();
@@ -272,56 +355,82 @@ def home():
 </body>
 </html>
         """,
-        state=current_state,
-        move_count=move_count,
+        state=state,
+        moves=moves,
         tiles=tiles,
     )
 
-
 @app.route("/move", methods=["POST"])
 def move_tile():
-    global current_state, move_count
-    if not current_state:
-        return jsonify({"state": current_state, "move_count": move_count, "solved": False})
+    st = _get_state()
+    if not st:
+        return jsonify({"state": st, "move_count": _get_moves(), "solved": False})
 
     try:
         tile = int(request.form["tile"])
     except Exception:
-        return jsonify({"state": current_state, "move_count": move_count, "solved": False})
+        return jsonify({"state": st, "move_count": _get_moves(), "solved": False})
 
-    blank_index = current_state.index(0)
-    tile_index = current_state.index(tile)
-
-    rb, cb = divmod(blank_index, 3)
-    rt, ct = divmod(tile_index, 3)
+    blank = st.index(0)
+    ti = st.index(tile)
+    rb, cb = divmod(blank, 3)
+    rt, ct = divmod(ti, 3)
 
     if abs(rb - rt) + abs(cb - ct) == 1:
-        current_state[blank_index], current_state[tile_index] = current_state[tile_index], current_state[blank_index]
-        move_count += 1
-        solved = current_state == list(range(1, 9)) + [0]
-        return jsonify({"state": current_state, "move_count": move_count, "solved": solved})
+        st[blank], st[ti] = st[ti], st[blank]
+        _set_state(st)
+        _set_moves(_get_moves() + 1)
+        solved = st == list(range(1, 9)) + [0]
+        return jsonify({"state": st, "move_count": _get_moves(), "solved": solved})
 
-    return jsonify({"state": current_state, "move_count": move_count, "solved": False})
+    return jsonify({"state": st, "move_count": _get_moves(), "solved": False})
 
-
-@app.route("/solution", methods=["GET"])
+@app.route("/solution")
 def show_solution():
-    global current_state
-    current_state = list(range(1, 9)) + [0]  # Solved state
-    return jsonify({"state": current_state})
+    _set_state(list(range(1, 9)) + [0])
+    return jsonify({"state": _get_state()})
 
-
-@app.route("/minimum-moves", methods=["GET"])
+@app.route("/minimum-moves")
 def minimum_moves():
-    global current_state
-    if current_state and is_solvable(current_state):
-        moves = a_star_search(current_state)
-        return jsonify({"minimum_moves": moves})
+    st = _get_state()
+    heur = request.args.get("heuristic", "manhattan")
+    if st and is_solvable(st):
+        moves, _ = a_star_with_path(st, heur)
+        return jsonify({"minimum_moves": moves, "heuristic": heur})
     return jsonify({"error": "This puzzle state is not solvable or not started"})
 
+@app.route("/solve")
+def solve():
+    st = _get_state()
+    heur = request.args.get("heuristic", "manhattan")
+    if st and is_solvable(st):
+        moves, path = a_star_with_path(st, heur)
+        return jsonify({"moves": moves, "path": [list(p) for p in path], "heuristic": heur})
+    return jsonify({"error": "No solution available"})
+
+@app.route("/hint")
+def hint():
+    st = _get_state()
+    if st and is_solvable(st):
+        _, path = a_star_with_path(st, "manhattan")
+        if path:
+            return jsonify({"next_state": list(path[0])})
+    return jsonify({"error": "No hint available"})
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True, "uptime_sec": round(time.time() - START_TS, 1)})
+
+@app.route("/metrics")
+def metrics():
+    return jsonify({
+        "has_state": bool(_get_state()),
+        "moves": _get_moves(),
+        "tiles": len(_get_tiles()),
+    })
 
 # -----------------------------------------------------------------------------
-# Run (Render injects PORT). DO NOT USE debug=True in production.
+# Run (Render sets PORT)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
