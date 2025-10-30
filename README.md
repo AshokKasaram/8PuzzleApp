@@ -69,16 +69,12 @@ This app showcases **artificial intelligence**, **algorithmic reasoning**, and *
 - **Educational Insight:** Visualizes how search and heuristics affect pathfinding
 
 ---
+### A* Search Objective
 
-## Algorithms in Action
+**Formula:** `f(n) = g(n) + h(n)`  
+- **g(n):** Cost so far (moves made)  
+- **h(n):** Heuristic estimate of remaining cost
 
-**A\*** **Search Objective**  
-$$
-f(n) = g(n) + h(n)
-$$
-
-- \(g(n)\): cost so far (moves made)  
-- \(h(n)\): heuristic estimate of remaining cost
 
 ### Heuristic Comparison
 
