@@ -104,7 +104,7 @@ pip install -r requirements.txt
 # Run the app locally
 python app.py
 
-Now visit 👉 [http://localhost:5000](http://localhost:5000)
+Now visit [http://localhost:5000](http://localhost:5000)
 
 ---
 
