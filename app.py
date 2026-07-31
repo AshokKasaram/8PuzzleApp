@@ -14,7 +14,7 @@ from werkzeug.utils import secure_filename
 from PIL import Image
 
 # -----------------------------------------------------------------------------
-# App / config
+# App / configuration
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "dev-only-change-me")  # set SECRET_KEY in Render
@@ -160,7 +160,7 @@ def a_star_with_path(initial_state, heuristic="manhattan"):
     return -1, []
 
 # -----------------------------------------------------------------------------
-# Security headers (allow inline JS so the buttons work)
+# Security headers
 # -----------------------------------------------------------------------------
 @app.after_request
 def add_security_headers(resp):
