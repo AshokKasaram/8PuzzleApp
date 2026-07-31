@@ -10,8 +10,6 @@
 Welcome to **8PuzzleApp**, an interactive AI-powered puzzle solver built with **Flask**, **Python**, and **JavaScript**.  
 Upload any image and the app transforms it into a classic 3×3 *8-puzzle*, then uses the **A\*** search algorithm to compute and visualize the shortest solution path.
 
-This app showcases **artificial intelligence**, **algorithmic reasoning**, and **full-stack web development** — perfect for highlighting data science, AI, and software engineering skills.
-
 ---
 
 ## Key Features
@@ -33,7 +31,7 @@ This app showcases **artificial intelligence**, **algorithmic reasoning**, and *
 
 ---
 
-## Technical Highlights
+## Technical Stack
 
 | Layer         | Technology                 | Description                                              |
 |---------------|----------------------------|----------------------------------------------------------|
